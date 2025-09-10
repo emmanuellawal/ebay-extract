@@ -1,5 +1,4 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:appraisal_app/api_client.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 

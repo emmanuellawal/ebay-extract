@@ -72,10 +72,27 @@ See project_tasks.md for full instructions.
    pip install -r requirements.txt
    ```
 
-2. Set up your OpenAI API key in the `.env` file:
+2. Set up your environment variables:
    ```bash
-   # Edit backend/.env and replace the placeholder with your actual API key
-   OPENAI_API_KEY=your-actual-openai-api-key-here
+   # Option 1: Use the automated setup script (recommended)
+   python setup_env.py
+   
+   # Option 2: Manual setup
+   # Copy the template and edit with your API keys
+   cp backend/env.template backend/.env
+   # Edit backend/.env and replace the placeholder values
+   ```
+   
+   **Required API Keys:**
+   - **OpenAI API Key**: Get from [platform.openai.com](https://platform.openai.com/api-keys)
+   - **eBay API Key**: Get from [developer.ebay.com](https://developer.ebay.com/) (optional for now)
+   
+   **Environment Variables:**
+   ```bash
+   OPENAI_API_KEY=your-openai-api-key-here
+   EBAY_API_KEY=your-ebay-api-key-here  # Optional
+   BACKEND_HOST=127.0.0.1
+   BACKEND_PORT=5000
    ```
 
 3. Start the backend server:
@@ -97,6 +114,29 @@ See project_tasks.md for full instructions.
    flutter run
    ```
    - Use an emulator or physical device. The app will display results from the backend, including mock eBay prices.
+
+## Environment Configuration
+
+The project uses environment variables for configuration. All sensitive data like API keys are stored in a `.env` file that is excluded from version control.
+
+### Environment Variables
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `OPENAI_API_KEY` | Yes | OpenAI API key for image analysis | - |
+| `EBAY_API_KEY` | No | eBay API key for pricing data | - |
+| `BACKEND_HOST` | No | Backend server host | `127.0.0.1` |
+| `BACKEND_PORT` | No | Backend server port | `5000` |
+| `BACKEND_DEBUG` | No | Enable debug mode | `True` |
+| `OPENAI_MODEL` | No | OpenAI model to use | `gpt-4o-mini` |
+| `LOG_LEVEL` | No | Logging level | `INFO` |
+
+### Security Notes
+
+- Never commit `.env` files to version control
+- The `.env` file is automatically excluded by `.gitignore`
+- Use `env.template` as a reference for required variables
+- API keys should be kept secure and not shared
 
 ## Testing
 
