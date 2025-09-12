@@ -1,0 +1,725 @@
+﻿1) Product Name
+estate-intake — an MVP pipeline that converts folders of product photos (plus optional hint JSON) into normalized product metadata, mock market comps, price/time recommendations, and estate-level reports.
+2) Purpose & Scope
+* Purpose: Help estate sellers decide whether to sell fast (lower price) or wait (higher price) by estimating time-to-sell and net proceeds for each item, and totals for the estate.
+
+* Scope (MVP):
+
+   * Ingest items from products/ organized as “cases”.
+
+   * Extract structured data from images and hints (LLM optional; offline fallback required).
+
+   * Generate comps via a deterministic stub (no external APIs required).
+
+   * Compute Quick/Fair/Max pricing, DOM (days on market), fees, and net.
+
+   * Output per-item JSON + an estate report (JSON + HTML).
+
+   * Idempotent runs with caching and a manifest.
+
+3) High-Level Architecture
+      * CLI: estate-intake run --products ... --results ... [--force] [--dry-run] [--config ...]
+
+      * Modules:
+
+         * config.py — loads defaults + YAML + .env
+
+         * models.py — Pydantic v2 domain models (items, comps, reports)
+
+         * discovery.py — find cases, read hints, collect media, fingerprint
+
+         * llm_extract.py — build IntakeBundle from hints + images; offline fallback
+
+         * comps/ebay_stub.py — mock comps provider (deterministic)
+
+         * pricing.py — Quick/Fair/Max quotes from comps
+
+         * reporting.py — per-item report, estate rollup, HTML
+
+         * pipeline.py — orchestrates per-case processing + overall manifest
+
+         * cli.py — argument parsing, config load, run
+
+         * utils.py — helpers (hashing, IO)
+
+            * Data Flow: products/cases → discovery → (optional LLM) extraction → comps (stub) → pricing → reporting → results/ tree.
+
+4) Runtime & Directory Layout
+4.1 CLI
+estate-intake run --products ./products --results ./results \
+  [--force] [--dry-run] [--max-workers 4] [--log-level INFO] [--config ./config.yaml]
+
+
+               * --force: ignore cache and reprocess.
+
+               * --dry-run: parse/compute but don’t write results (except console/log).
+
+               * --config: merge YAML values over defaults.
+
+4.2 Input (products/)
+Each case is a direct child folder:
+products/
+  case-001-single/
+    product.json   # optional (single item hints)
+    img-1.jpg
+  case-002-multi-img/
+    product.json   # optional
+    img-1.jpg img-2.jpg img-3.jpg
+  case-003-multi-product/
+    case.json      # optional (multi item hints)
+    photo.jpg
+
+
+                  * Images recognized: .jpg .jpeg .png .webp .heic
+
+                  * Files prefixed _ are ignored.
+
+4.3 Output (results/)
+results/
+  manifest.json
+  case-001-single/
+    _run_meta.json
+    estate_report.json
+    estate_report.html
+    products/
+      <sku>/
+        metadata.json       # normalized Item (Pydantic dump)
+        item_report.json    # quotes + recommendation
+        images/
+          01.jpg 02.jpg ...
+  case-002-multi-img/
+    ...
+  case-003-multi-product/
+    ...
+
+
+5) Configuration
+Default config.yaml (can be overridden):
+llm:
+  enabled: false            # when false, use offline fallback
+  model: gpt-4o-mini
+  temperature: 0
+pricing:
+  default_fee_pct: 0.13
+  storage_cost_per_month: 50
+  dom_cap_days: 90
+comps:
+  provider: "stub"          # later: "ebay"
+  window_days: 90
+io:
+  image_max_edge_px: 3000
+  ignore_prefix: "_"
+
+
+.env.example: OPENAI_API_KEY= (used only if llm.enabled=true).
+6) Domain Model (Pydantic v2)
+6.1 Enums (Literals)
+                     * Condition: "For Parts or Not Working" | "Acceptable" | "Good" | "Very Good" | "Excellent" | "Open Box" | "New (Other)" | "New"
+
+                     * CategoryHint: "vehicle" | "trading_card" | "book" | "apparel" | "electronics" | "generic"
+
+                     * Strategy: "quick" | "fair" | "max"
+
+6.2 Core
+                        * Media { source: "file"|"url"|"data_url", path?, url?, data_url?, alt? }
+
+                        * Measurements { length_in?, width_in?, height_in?, weight_oz? }
+
+                        * Pricing { ask_price_usd?, floor_price_usd?, auction: bool=False, auction_days: int=7, best_offer: bool=True }
+
+                        * Shipping { policy_id?, service_hint?, handling_days: int=1 }
+
+6.3 Category Specifics (optional)
+                           * VehicleSpecifics { vin?, year?, make?, model?, trim?, body_type?, mileage?, transmission?, drivetrain?, fuel_type?, exterior_color?, interior_color?, title_status? }
+
+                           * TradingCardSpecifics { sport?, year?, set_name?, player?, card_number?, parallel_or_variant?, grade?, grader?, rookie?, autograph?, memorabilia? }
+
+                           * BookSpecifics { author?, publisher?, year?, edition?, isbn_10?, isbn_13?, format?, language?, series?, code_or_mpn? }
+
+                           * ApparelSpecifics { brand?, gender?, size?, size_type?, color?, material?, style? }
+
+                           * ElectronicsSpecifics { brand?, model?, mpn?, storage_capacity?, color? }
+
+                           * GenericSpecifics { aspects: dict[str, str|int|float|bool] }
+
+6.4 Item & Containers
+                              * Item (extra=forbid):
+
+                                 * Identity: sku: str, title: str, subtitle?, brand?, model?, category_hint: CategoryHint
+
+                                 * Condition: condition_grade: Condition, condition_notes?
+
+                                 * Media: photos: list[Media], measurements: Measurements
+
+                                 * Attributes: attributes: dict[str, str|int|float|bool]
+
+                                 * Specifics: vehicle?, card?, book?, apparel?, electronics?, generic?
+
+                                 * Listing meta: pricing: Pricing, shipping: Shipping, item_specifics: dict[str, list[str]]
+
+                                 * Lots: is_lot: bool=False, lot_children: list[Item]=[]
+
+                                    * LotMetadata { lot_id: str, list_strategy: "individual"|"lot"|"mixed", location_zip?, notes? }
+
+                                    * IntakeBundle { case_id: str, lot_metadata: LotMetadata, items: list[Item] }
+
+6.5 Comps & Reports
+                                       * CompStats { sold_count:int, active_count:int, sell_through_pct:float, median_sold:float, p10_sold:float, p90_sold:float, avg_dom_days:float }
+
+                                       * StrategyQuote { strategy: "quick"|"fair"|"max", ask_price: float, est_dom_days: int, fee_pct: float, est_fees: float, est_shipping_cost: float, est_net_proceeds: float }
+
+                                       * ItemReport { sku, title, category_hint, condition_grade, comp: CompStats, quotes: list[StrategyQuote], recommendation: "quick"|"fair"|"max", notes?: str }
+
+                                       * EstateRollup { totals: {quick:{gross, net, avg_dom}, fair:{...}, max:{...}}, items: list[ItemReport] }
+
+7) Processing Pipeline (per case)
+                                          1. Discover
+
+                                             * Find case folder; collect images (sorted), load product.json or case.json hints, compute fingerprint (filenames + sizes + mtimes + hints JSON).
+
+                                                2. Cache Check
+
+                                                   * If _run_meta.json exists with matching fingerprint and --force not set → skip (cache hit).
+
+                                                      3. Extract to IntakeBundle
+
+                                                         * If llm.enabled=false: create deterministic fallback:
+
+                                                            * If product.json implies one item → build one Item with photos and hints.
+
+                                                            * Else produce a single generic Item titled "Unlabeled Item" with photos.
+
+                                                               * If llm.enabled=true: call OpenAI via LangChain with_structured_output(IntakeBundle) using:
+
+                                                                  * System prompt (expert cataloger; conservative; one category block; lot support).
+
+                                                                  * Human message = hints text + images as data_url blocks.
+
+                                                                     * Ensure case_id and lot_metadata defaults if missing.
+
+                                                                        4. Per Item
+
+                                                                           * Assign sku if missing: <case-id>-<index>-<short-hash>.
+
+                                                                           * Comps: call comps/ebay_stub.get_comp_stats(item, window_days=config.comps.window_days).
+
+                                                                              * Deterministic values based on hash of sku+title.
+
+                                                                                 * Quotes: pricing.quotes_from_comps(comp, fee_pct, shipping_cost=None, dom_cap_days).
+
+                                                                                    * Rules (see §8).
+
+                                                                                       * ItemReport: reporting.build_item_report(...).
+
+                                                                                          * Recommendation heuristic (see §9).
+
+                                                                                             * Write outputs:
+
+                                                                                                * products/<sku>/metadata.json (Item dump).
+
+                                                                                                * products/<sku>/item_report.json (CompStats + StrategyQuotes + recommendation).
+
+                                                                                                * Copy/normalize images → products/<sku>/images/NN.jpg (0-padded order).
+
+                                                                                                   5. Estate Roll-up
+
+                                                                                                      * reporting.build_estate_rollup(item_reports).
+
+                                                                                                      * estate_report.json + estate_report.html (single table page).
+
+                                                                                                         6. Run Meta & Manifest
+
+                                                                                                            * Write _run_meta.json (fingerprint, times, counts, cache_hit flag).
+
+                                                                                                            * CLI aggregates all case summaries to results/manifest.json.
+
+8) Pricing & Time Rules (MVP)
+Given CompStats:
+                                                                                                               * Prices:
+
+                                                                                                                  * quick_price = max(p10_sold, 0.80 * median_sold)
+
+                                                                                                                  * fair_price = median_sold
+
+                                                                                                                  * max_price = min(p90_sold, 1.20 * median_sold)
+
+                                                                                                                     * DOM:
+
+                                                                                                                        * quick_dom = max(3, int(0.5 * avg_dom_days))
+
+                                                                                                                        * fair_dom = int(avg_dom_days)
+
+                                                                                                                        * max_dom = min(dom_cap_days, int(1.75 * avg_dom_days))
+
+                                                                                                                           * Fees & Net (per config):
+
+                                                                                                                              * fees = price * fee_pct (default 13%)
+
+                                                                                                                              * net = price - fees - (shipping_cost or 0)
+
+Emit three StrategyQuote objects (quick, fair, max) with computed values.
+9) Recommendation Heuristic (MVP)
+Inputs: quotes, sell_through_pct, storage_cost_per_month (config).
+                                                                                                                                 * Let max_net, fair_net, quick_net be respective net proceeds.
+
+                                                                                                                                 * If (max_net - fair_net) < storage_cost_per_month → recommend "fair".
+
+                                                                                                                                 * Else if sell_through_pct < 0.40 → recommend "quick" (low liquidity).
+
+                                                                                                                                 * Else → recommend the strategy with highest net.
+
+Add optional notes explaining the rule hit (stored in ItemReport.notes).
+10) Comps Provider (Stub)
+comps/ebay_stub.get_comp_stats(item, window_days=90):
+                                                                                                                                    * Seed RNG with hash(sku+title) → deterministic.
+
+                                                                                                                                    * Generate:
+
+                                                                                                                                       * median_sold ∈ [30, 120] (rounded to 2 decimals)
+
+                                                                                                                                       * p10_sold = 0.70 * median_sold
+
+                                                                                                                                       * p90_sold = 1.30 * median_sold
+
+                                                                                                                                       * avg_dom_days ∈ [7, 35]
+
+                                                                                                                                       * sold_count ∈ [10, 60]
+
+                                                                                                                                       * active_count ∈ [5, 40]
+
+                                                                                                                                       * sell_through_pct = sold / (sold + active)
+
+                                                                                                                                          * Return CompStats.
+
+(Provider is swappable later for real eBay APIs without changing the interface.)
+11) HTML Report (MVP)
+Single page, simple table:
+                                                                                                                                             * Columns: SKU, Title, Condition, Median Sold, Sell-Through %, Quick (Price / Net / Days), Fair (Price / Net / Days), Max (Price / Net / Days), Recommendation, Notes.
+
+                                                                                                                                             * Footer totals from EstateRollup.totals for Quick/Fair/Max: sum gross (ask_price), sum net, average DOM.
+
+12) Idempotency & Logs
+                                                                                                                                                * _run_meta.json: case_id, fingerprint, started_at, ended_at, item_count, cache_hit, warnings, errors.
+
+                                                                                                                                                * Fingerprint: SHA-256 of (filenames + sizes + mtimes + normalized hints JSON).
+
+                                                                                                                                                * manifest.json: list of {case_id, cache_hit, items_count, output_paths...}.
+
+13) Tests (smoke + rules)
+                                                                                                                                                   * Discovery smoke: temp case with 2 images + product.json → functions return expected sets; fingerprint stable.
+
+                                                                                                                                                   * Pricing rules: quick ≤ fair ≤ max; quick_dom ≤ fair_dom ≤ max_dom.
+
+                                                                                                                                                   * Pipeline smoke: run on three demo cases → results tree exists; each product has metadata.json, item_report.json, images; estate HTML contains <table>.
+
+                                                                                                                                                   * Determinism: running twice with no changes yields cache hit and identical summary values.
+
+14) Non-Goals (MVP)
+                                                                                                                                                      * No real marketplace API calls (comps are stubbed).
+
+                                                                                                                                                      * No inventory/offer creation for eBay (payload generation can be added later).
+
+                                                                                                                                                      * No advanced OCR or category routers (LLM optional; offline fallback must work).
+
+15) Extensibility Points
+                                                                                                                                                         * Real comps: implement comps/ebay.py with same get_comp_stats signature.
+
+                                                                                                                                                         * Category router: map category_hint → eBay categoryId when you add listing payloads.
+
+                                                                                                                                                         * LLM on: set llm.enabled=true to parse real images; swap prompts per category if needed.
+
+                                                                                                                                                         * Hooks: pre_extract, post_extract, before_write (to be added later) for custom transformations.
+
+16) Acceptance Criteria (end-to-end)
+                                                                                                                                                            1. estate-intake run --products products --results results produces:
+
+                                                                                                                                                               * results/manifest.json
+
+                                                                                                                                                               * For each case: _run_meta.json, estate_report.json, estate_report.html, product folders each with metadata.json, item_report.json, and images/NN.jpg.
+
+                                                                                                                                                                  2. A second run w/o changes sets cache_hit=true and does not rewrite product outputs.
+
+                                                                                                                                                                  3. Each item_report.json contains exactly 3 quotes (quick/fair/max) with coherent price & DOM ordering and a recommendation string.
+
+                                                                                                                                                                  4. estate_report.html renders a table and shows totals for Quick/Fair/Max.
+
+________________
+
+
+whoop-whoop! Below are copy-paste prompts you can feed to the VS Code Copilot Agent to drive the whole build in small, testable stages. Each step has: Goal → Actions → Acceptance checks. They assume Python 3.11+ on your machine.
+________________
+
+
+Prompt 1 — Bootstrap the workspace
+Paste to Copilot Agent:
+Goal: Initialize a Python repo for the “estate-intake” MVP with clean structure, tooling, and deps.
+
+
+Actions:
+1) Create files:
+- .gitignore (Python, venv, __pycache__, .env, .pytest_cache, .DS_Store)
+- README.md with a 1-paragraph project overview and quickstart
+- requirements.txt listing:
+  pydantic>=2
+  langchain>=0.2
+  langchain-openai
+  python-dotenv
+  pyyaml
+  pillow
+  rich
+  tqdm
+  pytest
+- .env.example with OPENAI_API_KEY=
+- config.yaml with defaults:
+  llm: {enabled: false, model: gpt-4o-mini, temperature: 0}
+  pricing: {default_fee_pct: 0.13, storage_cost_per_month: 50, dom_cap_days: 90}
+  comps: {provider: "stub", window_days: 90}
+  io: {image_max_edge_px: 3000, ignore_prefix: "_"}
+
+
+2) Create package skeleton:
+- src/estate_intake/{__init__.py, cli.py, config.py, models.py, discovery.py, llm_extract.py, pricing.py, reporting.py, pipeline.py, utils.py}
+- src/estate_intake/comps/{__init__.py, ebay_stub.py}
+- tests/__init__.py
+
+
+3) Open a terminal and run:
+python -m venv .venv
+(Windows) .venv\Scripts\activate
+(mac/linux) source .venv/bin/activate
+pip install -r requirements.txt
+
+
+Acceptance:
+- The tree exists, requirements install without error.
+- README.md describes quickstart and CLI use at high level.
+
+
+________________
+
+
+Prompt 2 — Implement core Pydantic models
+Paste to Copilot Agent:
+Goal: Implement data models exactly as the MVP spec.
+
+
+Actions:
+In src/estate_intake/models.py implement (Pydantic v2, extra="forbid"):
+- Enums as Literal: Condition, CategoryHint.
+- Core:
+  Media{source: "file"|"url"|"data_url", path?, url?, data_url?, alt?}
+  Measurements{length_in?, width_in?, height_in?, weight_oz?}
+  Pricing{ask_price_usd?, floor_price_usd?, auction:bool=False, auction_days:int=7, best_offer:bool=True}
+  Shipping{policy_id?, service_hint?, handling_days:int=1}
+- Category specifics:
+  VehicleSpecifics, TradingCardSpecifics, BookSpecifics, ApparelSpecifics, ElectronicsSpecifics, GenericSpecifics{aspects: dict[str, str|int|float|bool]}
+- Item{sku, title, subtitle?, brand?, model?, category_hint, condition_grade, condition_notes?, photos:list[Media], measurements, attributes:dict, vehicle?, card?, book?, apparel?, electronics?, generic?, pricing, shipping, item_specifics:dict[str, list[str]], is_lot:bool=False, lot_children:list[Item]=[]}
+- LotMetadata{lot_id, list_strategy, location_zip?, notes?}
+- IntakeBundle{case_id, lot_metadata, items:list[Item]}
+- Comps/Report:
+  CompStats{sold_count:int, active_count:int, sell_through_pct:float, median_sold:float, p10_sold:float, p90_sold:float, avg_dom_days:float}
+  StrategyQuote{strategy: Literal["quick","fair","max"], ask_price:float, est_dom_days:int, fee_pct:float, est_fees:float, est_shipping_cost:float, est_net_proceeds:float}
+  ItemReport{sku, title, category_hint, condition_grade, comp:CompStats, quotes:list[StrategyQuote], recommendation:Literal["quick","fair","max"], notes?:str}
+  EstateRollup{totals: dict, items:list[ItemReport]}
+
+
+Acceptance:
+- from estate_intake.models import Item, IntakeBundle, CompStats works in a Python shell.
+- ModelConfig forbids extra keys and enforces types.
+
+
+________________
+
+
+Prompt 3 — Config loader
+Paste to Copilot Agent:
+Goal: Load config.yaml + .env; expose helpers.
+
+
+Actions:
+In src/estate_intake/config.py implement:
+- load_config(path: str|None) -> dict
+  * Start with defaults embedded in code (match config.yaml).
+  * If path provided, merge YAML into defaults (deep merge).
+  * Load .env via dotenv; do not crash if missing.
+- get_fee_pct(category_hint: str|None) -> float (for now return default_fee_pct)
+- get_storage_cost_per_month(cfg: dict) -> float
+
+
+Acceptance:
+- from estate_intake.config import load_config returns dict with llm.enabled etc.
+- If config.yaml missing fields, defaults persist.
+
+
+________________
+
+
+Prompt 4 — Discovery + case fingerprint
+Paste to Copilot Agent:
+Goal: Implement case discovery, media collection, hint reading, fingerprinting.
+
+
+Actions:
+In src/estate_intake/discovery.py implement:
+- discover_cases(products_dir: Path, ignore_prefix: str) -> list[Path]
+  * Return immediate subfolders not starting with ignore_prefix.
+- collect_media(case_dir: Path, ignore_prefix: str) -> list[Path]
+  * Include images: .jpg .jpeg .png .webp .heic ; exclude names starting with ignore_prefix; sort.
+- read_hints(case_dir: Path) -> dict
+  * Load product.json or case.json if present; else {}.
+- compute_fingerprint(case_dir: Path, media_files: list[Path], hints: dict) -> str
+  * SHA256 of filenames + sizes + mtimes + canonicalized hints JSON.
+
+
+Acceptance:
+- Unit-test-ish sanity: add a quick test in tests/test_discovery_smoke.py that makes a temp case dir with 2 images + product.json and asserts functions behave as spec.
+
+
+________________
+
+
+Prompt 5 — LLM extraction with offline fallback
+Paste to Copilot Agent:
+Goal: Implement llm_extract that can run WITHOUT an API key (offline fallback), so tests pass.
+
+
+Actions:
+In src/estate_intake/llm_extract.py implement:
+- extract_bundle(case_id: str, image_paths: list[Path], hints: dict, config: dict) -> IntakeBundle
+  * If config["llm"]["enabled"] is False, build a deterministic IntakeBundle:
+      - One Item per hint (if product.json has enough for single) OR
+      - If no hints, create a single generic Item with sku=f"{case_id}-001", title="Unlabeled Item", photos from files.
+  * If enabled is True:
+      - Use langchain_openai.ChatOpenAI(...).with_structured_output(IntakeBundle)
+      - System prompt: expert cataloger; conservative; one category block; supports lots.
+      - Human: include hints text + image blocks (read files and attach as data_url).
+      - Return validated IntakeBundle; fill .case_id and default LotMetadata if missing.
+
+
+Acceptance:
+- With llm.enabled=false, running extract_bundle on a case with images returns a valid IntakeBundle with ≥1 Item and populated photos.
+
+
+________________
+
+
+Prompt 6 — Comps stub provider
+Paste to Copilot Agent:
+Goal: Deterministic comps without hitting eBay.
+
+
+Actions:
+In src/estate_intake/comps/ebay_stub.py implement:
+- async def get_comp_stats(item: Item, window_days: int = 90) -> CompStats
+  * Seed a RNG with hash(sku+title). Generate:
+    - median_sold in [30..120]
+    - p10_sold = round(0.7 * median, 2)
+    - p90_sold = round(1.3 * median, 2)
+    - avg_dom_days in [7..35]
+    - sold_count in [10..60]
+    - active_count in [5..40]
+    - sell_through_pct = sold / (sold + active)
+  * Return CompStats
+
+
+Acceptance:
+- A quick async test fetches CompStats twice for the same item and gets identical numbers.
+
+
+________________
+
+
+Prompt 7 — Pricing engine (Quick/Fair/Max)
+Paste to Copilot Agent:
+Goal: Convert CompStats → three StrategyQuote entries.
+
+
+Actions:
+In src/estate_intake/pricing.py implement:
+- def quotes_from_comps(comp: CompStats, fee_pct: float, shipping_cost: float|None, dom_cap_days:int) -> list[StrategyQuote]
+  Rules:
+    quick_price = max(comp.p10_sold, 0.80 * comp.median_sold)
+    fair_price  = comp.median_sold
+    max_price   = min(comp.p90_sold, 1.20 * comp.median_sold)
+    quick_dom = max(3, int(0.5 * comp.avg_dom_days))
+    fair_dom  = int(comp.avg_dom_days)
+    max_dom   = min(dom_cap_days, int(1.75 * comp.avg_dom_days))
+    fees = price * fee_pct
+    ship = shipping_cost or 0.0
+    net = price - fees - ship
+  Emit three StrategyQuote objects with strategies: quick, fair, max.
+
+
+Acceptance:
+- A simple test verifies monotonicity: quick_price ≤ fair_price ≤ max_price; quick_dom ≤ fair_dom ≤ max_dom.
+
+
+________________
+
+
+Prompt 8 — Reporting (per-item and estate rollup)
+Paste to Copilot Agent:
+Goal: Emit JSON reports and a simple HTML estate summary.
+
+
+Actions:
+In src/estate_intake/reporting.py implement:
+- def build_item_report(item: Item, comp: CompStats, quotes: list[StrategyQuote], storage_cost_per_month: float) -> ItemReport
+  * Recommendation heuristic (MVP):
+     - If (max_net - fair_net) < storage_cost_per_month → recommend "fair"
+     - Else if sell_through_pct < 0.4 → recommend "quick"
+     - Else recommend the one with highest net
+- def build_estate_rollup(item_reports: list[ItemReport]) -> EstateRollup
+  * Compute totals for quick/fair/max: sum gross (ask_price), sum net, and average DOM.
+- def estate_html(item_reports: list[ItemReport], rollup: EstateRollup) -> str
+  * Minimal one-page HTML table: SKU, Title, Condition, Median, Sell-through, Quick/Fair/Max (price/net/days), Recommendation.
+
+
+Acceptance:
+- Given 2-3 ItemReports, build_estate_rollup returns sane totals; HTML string contains a <table>.
+
+
+________________
+
+
+Prompt 9 — Pipeline + CLI
+Paste to Copilot Agent:
+Goal: Wire everything together with caching and a runnable CLI.
+
+
+Actions:
+In src/estate_intake/pipeline.py implement:
+- def process_case(case_dir: Path, results_dir: Path, cfg: dict, force: bool=False) -> dict
+  * Discover media, read hints, fingerprint, check cache at results/<case>/_run_meta.json
+  * If skip (not force), return {"case_id":..., "cache_hit": true}
+  * Run extract_bundle → IntakeBundle
+  * For each Item:
+     - Call comps.get_comp_stats (await via asyncio.gather for speed)
+     - Call pricing.quotes_from_comps
+     - reporting.build_item_report
+     - Write product folder: metadata.json (Item), item_report.json, copy/normalize images to images/NN.jpg
+  * After items: reporting.build_estate_rollup + estate_html; write estate_report.json & estate_report.html
+  * Write _run_meta.json (fingerprint, started/ended timestamps, counts)
+  * Return a summary dict for manifest
+
+
+- def process_all(products_dir: Path, results_dir: Path, cfg: dict, force: bool=False, max_workers:int=4) -> dict
+  * Iterate cases and call process_case sequentially (MVP) or with limited concurrency.
+
+
+In src/estate_intake/cli.py implement click/argparse CLI:
+estate-intake run --products ./products --results ./results [--force] [--dry-run] [--config ./config.yaml]
+
+
+Main behavior:
+- Load config (merge file over defaults)
+- Ensure results/ exists; write manifest.json with array of per-case summaries
+
+
+Acceptance:
+- Running `python -m estate_intake.cli run --products products --results results` succeeds and creates results tree.
+
+
+________________
+
+
+Prompt 10 — Seed the three demo cases
+Paste to Copilot Agent:
+Goal: Create the products/ test data with three scenarios and a tiny script to generate placeholder images.
+
+
+Actions:
+1) Create products/ with:
+- case-001-single/{product.json,img-1.jpg}
+- case-002-multi-img/{product.json,img-1.jpg,img-2.jpg,img-3.jpg}
+- case-003-multi-product/{case.json,photo.jpg}
+
+
+2) Add product.json examples:
+case-001-single/product.json:
+{
+  "title": "AD&D 2e Player's Handbook (Black Cover) TSR 2159",
+  "category_hint": "book",
+  "book": {"publisher": "TSR", "edition": "2nd Edition", "code_or_mpn": "2159", "format": "Hardcover"}
+}
+case-002-multi-img/product.json:
+{
+  "title": "Apple iPhone 13 Pro Max 256GB",
+  "category_hint": "electronics",
+  "electronics": {"brand": "Apple", "model": "iPhone 13 Pro Max", "storage_capacity": "256GB"},
+  "condition_grade": "Very Good"
+}
+case-003-multi-product/case.json:
+{"lot_metadata": {"list_strategy": "individual"}, "expected_products": 3, "notes":"three small items in one photo"}
+
+
+3) Create a script tools/make_placeholders.py that uses Pillow to draw simple JPGs labeled "case-001 img-1", etc., 600x400. Run it to populate missing images.
+
+
+Acceptance:
+- products/ has 3 case folders; each contains the specified JSON and JPGs.
+
+
+________________
+
+
+Prompt 11 — Run the pipeline and verify
+Paste to Copilot Agent:
+Goal: Execute the pipeline, verify outputs, and inspect the estate HTML.
+
+
+Actions:
+1) Open terminal:
+python -m estate_intake.cli run --products products --results results
+
+
+2) Inspect:
+- results/manifest.json exists and lists 3 cases.
+- Each case folder has _run_meta.json.
+- Each product has metadata.json, item_report.json, and images/NN.jpg.
+- results/<case>/estate_report.html renders a table.
+
+
+3) Re-run without changes. Confirm _run_meta.json shows cache_hit true and timestamps of product files don’t change.
+
+
+Acceptance:
+- All checks pass; no exceptions thrown.
+
+
+________________
+
+
+Prompt 12 — Minimal tests
+Paste to Copilot Agent:
+Goal: Add a few pytest checks for structure and determinism.
+
+
+Actions:
+Create tests/test_pipeline_smoke.py to:
+- Run process_all on the products/ folder and assert manifest keys exist.
+- Assert each case has ≥1 product and item_report.json with three quotes.
+- Assert running twice returns the same manifest summaries (except timestamps).
+
+
+Add tests/test_pricing_rules.py to verify quick ≤ fair ≤ max prices and DOM order.
+
+
+Add a GitHub-style workflow note in README for running pytest.
+
+
+Acceptance:
+- `pytest -q` passes locally.
+
+
+________________
+
+
+Optional follow-ons (when you’re ready)
+                                                                                                                                                                     * Swap comps.provider: "ebay" and implement a real eBay Browse/Finding client behind the same get_comp_stats interface.
+
+                                                                                                                                                                     * Turn on llm.enabled: true to parse real images (requires OPENAI_API_KEY).
+
+                                                                                                                                                                     * Add a category → eBay categoryId router and export Inventory/Offer payloads in the product folders.
+
+If you want, I can also give you checklist prompts for each module’s acceptance tests (edge cases, empty hints, no images, etc.).

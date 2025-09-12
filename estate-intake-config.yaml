@@ -1,0 +1,17 @@
+llm:
+  enabled: false
+  model: gpt-4o-mini
+  temperature: 0
+
+pricing:
+  default_fee_pct: 0.13
+  storage_cost_per_month: 50
+  dom_cap_days: 90
+
+comps:
+  provider: "stub"
+  window_days: 90
+
+io:
+  image_max_edge_px: 3000
+  ignore_prefix: "_"

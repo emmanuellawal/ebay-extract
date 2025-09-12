@@ -258,85 +258,343 @@ class EbayAPIClient:
             "average_price": round(average_price, 2)
         }
     
+    def analyze_pricing_advanced(self, search_results: Dict[str, Any], openai_output: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Advanced pricing analysis with sophisticated sell time estimation.
+        
+        Args:
+            search_results: Results from eBay search
+            openai_output: Enhanced structured data from OpenAI
+            
+        Returns:
+            Dict containing comprehensive pricing and timing analysis
+        """
+        item_summaries = search_results.get("itemSummaries", [])
+        
+        if not item_summaries:
+            return {
+                "quick_sell_price": 0,
+                "patient_sell_price": 0,
+                "market_price": 0,
+                "sell_time_estimate": "No similar items found - may take 60+ days or require auction format",
+                "sell_time_days": "60+",
+                "listings_count": 0,
+                "price_range": {"min": 0, "max": 0},
+                "confidence_level": "very_low",
+                "market_analysis": "Insufficient data for analysis"
+            }
+        
+        # Extract and validate prices
+        prices = []
+        listing_types = {"auction": 0, "buy_it_now": 0}
+        condition_distribution = {}
+        
+        for item in item_summaries:
+            price_info = item.get("price", {})
+            if price_info and "value" in price_info:
+                try:
+                    price = float(price_info["value"])
+                    prices.append(price)
+                    
+                    # Track listing types
+                    if item.get("buyingOptions", []):
+                        if "AUCTION" in item.get("buyingOptions", []):
+                            listing_types["auction"] += 1
+                        else:
+                            listing_types["buy_it_now"] += 1
+                    
+                    # Track condition distribution
+                    condition = item.get("condition", "Unknown")
+                    condition_distribution[condition] = condition_distribution.get(condition, 0) + 1
+                    
+                except (ValueError, TypeError):
+                    continue
+        
+        if not prices:
+            return {
+                "quick_sell_price": 0,
+                "patient_sell_price": 0,
+                "market_price": 0,
+                "sell_time_estimate": "No valid pricing data found",
+                "sell_time_days": "Unknown",
+                "listings_count": len(item_summaries),
+                "confidence_level": "very_low",
+                "market_analysis": "Unable to extract pricing information"
+            }
+        
+        # Sort prices and calculate statistics
+        prices.sort()
+        total_listings = len(prices)
+        
+        # Advanced pricing calculations
+        percentile_10 = prices[int(total_listings * 0.1)] if total_listings > 10 else prices[0]
+        percentile_25 = prices[int(total_listings * 0.25)] if total_listings > 4 else prices[0]
+        median_price = prices[int(total_listings * 0.5)]
+        percentile_75 = prices[int(total_listings * 0.75)] if total_listings > 4 else prices[-1]
+        percentile_90 = prices[int(total_listings * 0.9)] if total_listings > 10 else prices[-1]
+        average_price = sum(prices) / len(prices)
+        
+        # Extract market indicators from OpenAI analysis
+        market_indicators = openai_output.get("market_indicators", {})
+        condition = openai_output.get("condition", "unknown")
+        rarity = market_indicators.get("rarity", "common")
+        demand_level = market_indicators.get("demand_level", "medium")
+        collectible_potential = market_indicators.get("collectible_potential", "none")
+        
+        # Sophisticated sell time estimation
+        sell_time_factors = []
+        base_sell_days = 14  # Base selling time
+        
+        # Factor 1: Competition level
+        if total_listings < 5:
+            competition_multiplier = 0.7
+            sell_time_factors.append("Low competition (+fast)")
+        elif total_listings < 15:
+            competition_multiplier = 1.0
+            sell_time_factors.append("Moderate competition")
+        elif total_listings < 30:
+            competition_multiplier = 1.4
+            sell_time_factors.append("High competition (+slow)")
+        else:
+            competition_multiplier = 2.0
+            sell_time_factors.append("Very high competition (+very slow)")
+        
+        # Factor 2: Price positioning
+        if condition in ["new", "like_new"] and rarity in ["rare", "very_rare"]:
+            price_multiplier = 0.8
+            sell_time_factors.append("Premium item (+fast)")
+        elif demand_level == "high":
+            price_multiplier = 0.9
+            sell_time_factors.append("High demand (+fast)")
+        elif demand_level == "low":
+            price_multiplier = 1.5
+            sell_time_factors.append("Low demand (+slow)")
+        else:
+            price_multiplier = 1.0
+            sell_time_factors.append("Average demand")
+        
+        # Factor 3: Collectible potential
+        if collectible_potential == "high":
+            collectible_multiplier = 0.8
+            sell_time_factors.append("High collectible value (+fast)")
+        elif collectible_potential == "medium":
+            collectible_multiplier = 0.9
+            sell_time_factors.append("Some collectible value")
+        else:
+            collectible_multiplier = 1.1
+            sell_time_factors.append("Non-collectible")
+        
+        # Factor 4: Condition impact
+        if condition in ["poor", "acceptable"]:
+            condition_multiplier = 1.6
+            sell_time_factors.append("Lower condition (+slow)")
+        elif condition in ["new", "like_new"]:
+            condition_multiplier = 0.8
+            sell_time_factors.append("Excellent condition (+fast)")
+        else:
+            condition_multiplier = 1.0
+            sell_time_factors.append("Good condition")
+        
+        # Calculate final sell time
+        total_multiplier = competition_multiplier * price_multiplier * collectible_multiplier * condition_multiplier
+        estimated_sell_days = int(base_sell_days * total_multiplier)
+        
+        # Determine pricing strategy
+        quick_sell_price = percentile_25  # Price for fast sale (bottom 25%)
+        market_price = median_price  # Market average price
+        patient_sell_price = percentile_75  # Price for patient sale (top 25%)
+        
+        # Adjust prices based on condition and rarity
+        condition_adjustments = {
+            "new": 1.1, "like_new": 1.05, "very_good": 1.0,
+            "good": 0.9, "acceptable": 0.75, "poor": 0.6
+        }
+        
+        if condition in condition_adjustments:
+            adjustment = condition_adjustments[condition]
+            quick_sell_price *= adjustment
+            market_price *= adjustment
+            patient_sell_price *= adjustment
+        
+        # Confidence level calculation
+        if total_listings >= 20 and len(set(condition_distribution.keys())) <= 3:
+            confidence = "high"
+        elif total_listings >= 10:
+            confidence = "medium"
+        elif total_listings >= 5:
+            confidence = "low"
+        else:
+            confidence = "very_low"
+        
+        # Generate sell time description
+        if estimated_sell_days <= 7:
+            sell_time_desc = f"Quick sale expected (~{estimated_sell_days} days)"
+        elif estimated_sell_days <= 21:
+            sell_time_desc = f"Normal sale time (~{estimated_sell_days} days)"
+        elif estimated_sell_days <= 45:
+            sell_time_desc = f"Patient sale required (~{estimated_sell_days} days)"
+        else:
+            sell_time_desc = f"Long-term sale ({estimated_sell_days}+ days) - consider auction format"
+        
+        return {
+            "quick_sell_price": round(quick_sell_price, 2),
+            "market_price": round(market_price, 2),
+            "patient_sell_price": round(patient_sell_price, 2),
+            "sell_time_estimate": sell_time_desc,
+            "sell_time_days": str(estimated_sell_days),
+            "listings_count": total_listings,
+            "price_range": {
+                "min": round(min(prices), 2),
+                "max": round(max(prices), 2)
+            },
+            "price_percentiles": {
+                "p10": round(percentile_10, 2),
+                "p25": round(percentile_25, 2),
+                "p50": round(median_price, 2),
+                "p75": round(percentile_75, 2),
+                "p90": round(percentile_90, 2)
+            },
+            "average_price": round(average_price, 2),
+            "confidence_level": confidence,
+            "market_analysis": f"Based on {total_listings} similar listings. " + " • ".join(sell_time_factors),
+            "listing_distribution": listing_types,
+            "condition_distribution": condition_distribution
+        }
+    
     def search_and_analyze(self, 
                           openai_output: Dict[str, Any],
                           use_category: bool = True,
                           use_catalog: bool = True) -> Dict[str, Any]:
         """
-        Complete search and analysis workflow.
+        Enhanced search and analysis workflow using improved OpenAI structured data.
         
         Args:
-            openai_output: Structured output from OpenAI analysis
+            openai_output: Enhanced structured output from OpenAI analysis
             use_category: Whether to use Taxonomy API for category mapping
             use_catalog: Whether to use Catalog API for product identifiers
             
         Returns:
-            Dict containing complete analysis results
+            Dict containing comprehensive analysis results
         """
         try:
-            # Extract search parameters from OpenAI output
-            brand = openai_output.get("brand", "")
-            model = openai_output.get("model", "")
-            condition = openai_output.get("condition", "")
-            item_type = openai_output.get("item_type", "")
+            # Extract enhanced search parameters from OpenAI output
+            brand = openai_output.get("brand", "").strip()
+            model = openai_output.get("model", "").strip()
+            condition = openai_output.get("condition", "").strip()
+            item_type = openai_output.get("item_type", "").strip()
             identifiers = openai_output.get("identifiers", {})
+            search_keywords = openai_output.get("search_keywords", [])
+            comparable_items = openai_output.get("comparable_items", [])
+            market_indicators = openai_output.get("market_indicators", {})
             
-            # Build search keywords
-            keywords_parts = [part for part in [brand, model, condition] if part]
-            keywords = " ".join(keywords_parts)
+            # Build multiple search strategies for comprehensive results
+            search_strategies = []
             
-            if not keywords:
-                keywords = item_type or "item"
+            # Strategy 1: Exact brand + model search
+            if brand != "unknown" and model != "unknown":
+                exact_search = f"{brand} {model}"
+                search_strategies.append(("exact_match", exact_search))
             
-            logger.info(f"Searching for: {keywords}")
+            # Strategy 2: Use OpenAI-provided search keywords
+            if search_keywords:
+                keyword_search = " ".join(search_keywords[:4])  # Use top 4 keywords
+                search_strategies.append(("ai_keywords", keyword_search))
+            
+            # Strategy 3: Brand + item type
+            if brand != "unknown" and item_type != "unknown":
+                brand_type_search = f"{brand} {item_type}"
+                search_strategies.append(("brand_type", brand_type_search))
+            
+            # Strategy 4: Comparable items search
+            for comparable in comparable_items[:2]:  # Top 2 comparable items
+                if comparable and comparable != "unknown":
+                    search_strategies.append(("comparable", comparable))
+            
+            # Fallback strategy
+            if not search_strategies:
+                fallback = " ".join([part for part in [brand, model, item_type] if part != "unknown"])
+                if fallback:
+                    search_strategies.append(("fallback", fallback))
+                else:
+                    search_strategies.append(("basic", item_type or "item"))
+            
+            logger.info(f"Using {len(search_strategies)} search strategies")
             
             # Get category ID if requested
             category_id = None
-            if use_category and item_type:
+            if use_category and item_type != "unknown":
                 category_id = self.get_category_suggestions(item_type)
             
-            # Search catalog if identifiers are available
+            # Search catalog using identifiers
             catalog_data = None
             if use_catalog and identifiers:
                 for id_type, id_value in identifiers.items():
-                    if id_value:
+                    if id_value and id_value != "unknown":
                         catalog_data = self.search_catalog(id_value, id_type)
                         if catalog_data:
+                            logger.info(f"Found catalog data using {id_type}: {id_value}")
                             break
             
-            # Search for items
-            search_results = self.search_items(
-                keywords=keywords,
-                category_id=category_id,
-                limit=50,
-                sort="price"
-            )
+            # Execute multiple searches and combine results
+            all_search_results = []
+            used_keywords = []
             
-            # Analyze pricing
-            pricing_analysis = self.analyze_pricing(search_results)
+            for strategy_name, keywords in search_strategies:
+                logger.info(f"Executing {strategy_name} search: {keywords}")
+                
+                try:
+                    search_results = self.search_items(
+                        keywords=keywords,
+                        category_id=category_id,
+                        limit=30,  # Reduced per search to allow multiple searches
+                        sort="price"
+                    )
+                    
+                    if search_results.get("itemSummaries"):
+                        all_search_results.extend(search_results["itemSummaries"])
+                        used_keywords.append(f"{strategy_name}: {keywords}")
+                        
+                        # Stop if we have enough results
+                        if len(all_search_results) >= 50:
+                            break
+                            
+                except Exception as search_error:
+                    logger.warning(f"Search strategy '{strategy_name}' failed: {search_error}")
+                    continue
+            
+            # Create combined search results
+            combined_results = {
+                "itemSummaries": all_search_results[:50],  # Limit to 50 total results
+                "total": len(all_search_results)
+            }
+            
+            # Enhanced pricing analysis
+            pricing_analysis = self.analyze_pricing_advanced(combined_results, openai_output)
             
             # Combine results
             result = {
-                "search_keywords": keywords,
+                "search_strategies": used_keywords,
                 "category_id": category_id,
                 "catalog_data": catalog_data,
                 "pricing_analysis": pricing_analysis,
-                "raw_search_results": search_results
+                "raw_search_results": combined_results,
+                "market_context": market_indicators
             }
             
-            logger.info("Complete search and analysis completed successfully")
+            logger.info(f"Enhanced analysis completed: {len(all_search_results)} total listings analyzed")
             return result
             
         except Exception as e:
-            logger.error(f"Error in search and analysis: {str(e)}")
+            logger.error(f"Error in enhanced search and analysis: {str(e)}")
             return {
                 "error": str(e),
-                "search_keywords": keywords if 'keywords' in locals() else "",
+                "search_strategies": [],
                 "pricing_analysis": {
                     "quick_sell_price": 0,
                     "patient_sell_price": 0,
                     "sell_time_estimate": "Analysis failed",
-                    "listings_count": 0
+                    "listings_count": 0,
+                    "confidence_level": "low"
                 }
             }
 
